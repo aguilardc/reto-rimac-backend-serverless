@@ -1,0 +1,316 @@
+service: medical-appointment-system
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+  environment:
+    DYNAMODB_TABLE: ${self:service}-appointments-${self:provider.stage}
+    SNS_TOPIC_ARN: !Ref AppointmentTopic
+    SQS_PE_URL: !Ref SQSPE
+    SQS_CL_URL: !Ref SQSCL
+    EVENT_BUS_NAME: !Ref AppointmentEventBus
+    CONFIRMATION_SQS_URL: !Ref ConfirmationSQS
+    MYSQL_PE_HOST: ${env:MYSQL_PE_HOST}
+    MYSQL_PE_PORT: ${env:MYSQL_PE_PORT}
+    MYSQL_PE_USER: ${env:MYSQL_PE_USER}
+    MYSQL_PE_PASSWORD: ${env:MYSQL_PE_PASSWORD}
+    MYSQL_PE_DATABASE: ${env:MYSQL_PE_DATABASE}
+    MYSQL_CL_HOST: ${env:MYSQL_CL_HOST}
+    MYSQL_CL_PORT: ${env:MYSQL_CL_PORT}
+    MYSQL_CL_USER: ${env:MYSQL_CL_USER}
+    MYSQL_CL_PASSWORD: ${env:MYSQL_CL_PASSWORD}
+    MYSQL_CL_DATABASE: ${env:MYSQL_CL_DATABASE}
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - dynamodb:Query
+        - dynamodb:Scan
+        - dynamodb:GetItem
+        - dynamodb:PutItem
+        - dynamodb:UpdateItem
+      Resource:
+        - !GetAtt AppointmentsTable.Arn
+        - !Sub "arn:aws:dynamodb:${self:provider.region}:${aws:accountId}:table/${self:provider.environment.DYNAMODB_TABLE}/*"
+
+    - Effect: Allow
+      Action:
+        - sns:Publish
+      Resource: !Ref AppointmentTopic
+
+    - Effect: Allow
+      Action:
+        - sqs:SendMessage
+        - sqs:ReceiveMessage
+        - sqs:DeleteMessage
+        - sqs:GetQueueAttributes
+      Resource:
+        - !GetAtt SQSPE.Arn
+        - !GetAtt SQSCL.Arn
+        - !GetAtt ConfirmationSQS.Arn
+
+    - Effect: Allow
+      Action:
+        - events:PutEvents
+        - events:DescribeRule
+      Resource: !GetAtt AppointmentEventBus.Arn
+
+    - Effect: Allow
+      Action:
+        - logs:CreateLogGroup
+        - logs:CreateLogStream
+        - logs:DescribeLogStreams
+        - logs:PutLogEvents
+      Resource:
+        - !Sub "arn:aws:logs:${self:provider.region}:${aws:accountId}:log-group:/aws/events/${self:service}-eventbridge-logging-${self:provider.stage}:*"
+
+functions:
+  appointment:
+    handler: src/infrastructure/aws/lambdas/appointment.handler
+    events:
+      - http:
+          path: /appointments
+          method: post
+          cors: true
+      - http:
+          path: /appointments/{insuredId}
+          method: get
+          cors: true
+      - sqs:
+          arn: !GetAtt ConfirmationSQS.Arn
+          batchSize: 1
+
+  appointment_pe:
+    handler: src/infrastructure/aws/lambdas/appointment_pe.handler
+    timeout: 30
+    events:
+      - sqs:
+          arn: !GetAtt SQSPE.Arn
+          batchSize: 1
+
+  appointment_cl:
+    handler: src/infrastructure/aws/lambdas/appointment_cl.handler
+    timeout: 30
+    events:
+      - sqs:
+          arn: !GetAtt SQSCL.Arn
+          batchSize: 1
+
+resources:
+  Resources:
+    AppointmentsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.DYNAMODB_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: insuredId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: InsuredIdIndex
+            KeySchema:
+              - AttributeName: insuredId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+
+    AppointmentTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-appointments-topic-${self:provider.stage}
+
+    SQSPE:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-pe-queue-${self:provider.stage}
+        VisibilityTimeout: 60
+
+    SNSSubscriptionPE:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref AppointmentTopic
+        Protocol: sqs
+        Endpoint: !GetAtt SQSPE.Arn
+        FilterPolicyScope: MessageAttributes
+        FilterPolicy:
+          countryISO: [ "PE" ]
+
+    SQSCL:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-cl-queue-${self:provider.stage}
+        VisibilityTimeout: 60
+
+    SNSSubscriptionCL:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref AppointmentTopic
+        Protocol: sqs
+        Endpoint: !GetAtt SQSCL.Arn
+        FilterPolicyScope: MessageAttributes
+        FilterPolicy:
+          countryISO: [ "CL" ]
+
+    ConfirmationSQS:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-confirmation-queue-${self:provider.stage}
+        VisibilityTimeout: 60
+
+    AppointmentEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:service}-event-bus-${self:provider.stage}
+
+    AppointmentEventRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: appointment-event-rule
+        EventBusName: !Ref AppointmentEventBus
+        State: ENABLED
+        EventPattern:
+          source:
+            - "appointment-services"
+          detail-type:
+            - "AppointmentCompleted"
+        Targets:
+          - Arn: !GetAtt ConfirmationSQS.Arn
+            Id: confirmation-target
+            InputTransformer:
+              InputPathsMap:
+                appointmentId: "$.detail.appointmentId"
+                insuredId: "$.detail.insuredId"
+                countryISO: "$.detail.countryISO"
+              InputTemplate: '{"appointmentId": <appointmentId>, "insuredId": <insuredId>, "countryISO": <countryISO>}'
+
+    EventBridgeLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: "/aws/events/${self:service}-eventbridge-logging-${self:provider.stage}"
+        RetentionInDays: 7
+
+    EventBridgeLoggingRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-eventbridge-logging-${self:provider.stage}
+        EventBusName: !Ref AppointmentEventBus
+        State: ENABLED
+        EventPattern:
+          source:
+            - "appointment-services"
+          detail-type:
+            - "AppointmentCompleted"
+        Targets:
+          - Arn: !GetAtt EventBridgeLogGroup.Arn
+            Id: EventBridgeLogTarget
+
+
+    ConfirmationSQSPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref ConfirmationSQS
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal: "*"
+              Action: "SQS:SendMessage"
+              Resource: !GetAtt ConfirmationSQS.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/${self:service}-event-bus-${self:provider.stage}/appointment-event-rule"
+
+    SQSPEPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref SQSPE
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal: "*"
+              Action: "SQS:SendMessage"
+              Resource: !GetAtt SQSPE.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref AppointmentTopic
+
+    SQSCLPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref SQSCL
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal: "*"
+              Action: "SQS:SendMessage"
+              Resource: !GetAtt SQSCL.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref AppointmentTopic
+
+    EventBridgeToSQSRule:
+      Type: AWS::Events::Rule
+      Properties:
+        EventBusName: !Ref AppointmentEventBus
+        EventPattern:
+          source:
+            - "appointment-services"
+          detail-type:
+            - "AppointmentCompleted"
+        Targets:
+          - Arn: !GetAtt ConfirmationSQS.Arn
+            Id: sqs-rule-target
+
+
+    EventBridgeLogPolicy:
+      Type: AWS::Logs::ResourcePolicy
+      Properties:
+        PolicyName: EventBridgeLogPolicy
+        PolicyDocument:
+          Fn::Sub: |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "events.amazonaws.com"
+                  },
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/events/${self:service}-eventbridge-logging-${self:provider.stage}:*"
+                }
+              ]
+            }
+
+plugins:
+  - serverless-webpack
+  - serverless-dynamodb-local
+  - serverless-dotenv-plugin
+
+custom:
+  webpack:
+    webpackConfig: ./webpack.config.js
+    includeModules: true
+  serverless-offline:
+    httpPort: 3000
+  dynamodb:
+    start:
+      port: 8000
+      inMemory: true
+      migrate: true

@@ -1,0 +1,42 @@
+flowchart TD
+    subgraph "API Gateway"
+        APIGateway[api gateway]
+    end
+
+    subgraph "Lambdas"
+        AppointmentLambda[appointment]
+        AppointmentPELambda[appointment_pe]
+        AppointmentCLLambda[appointment_cl]
+    end
+
+    subgraph "Mensajería"
+        SNSTopic[sns]
+        SQSPE[sqs_pe]
+        SQSCL[sqs_cl]
+        ConfirmationSQS[sqs]
+    end
+
+    subgraph "Eventos"
+        EventBridge[event bridge]
+    end
+
+    subgraph "Persistencia"
+        DynamoDB[(Amazon
+        DynamoDB)]
+        MYSQLPE[(mysql_pe)]
+        MYSQLCL[(mysql_cl)]
+    end
+
+    APIGateway --> AppointmentLambda
+    AppointmentLambda --> DynamoDB
+    AppointmentLambda --> SNSTopic
+    ConfirmationSQS --> AppointmentLambda
+    SNSTopic --> SQSPE
+    SNSTopic --> SQSCL
+    SQSPE --> AppointmentPELambda
+    SQSCL --> AppointmentCLLambda
+    AppointmentPELambda --> MYSQLPE
+    AppointmentCLLambda --> MYSQLCL
+    AppointmentPELambda --> EventBridge
+    AppointmentCLLambda --> EventBridge
+    EventBridge --> ConfirmationSQS
